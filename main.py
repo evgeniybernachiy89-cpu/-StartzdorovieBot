@@ -12,6 +12,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 STATE_FILE = "state.json"
 TIMEZONE = ZoneInfo("Europe/Moscow")
 SEND_HOUR = 7  # во сколько утра слать рацион (по Москве)
+START_WEIGHT = 90.0  # с чего начали — для расчёта прогресса в /ves
 
 DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 MEALS = ["завтрак", "обед", "перекус", "ужин"]
@@ -123,13 +124,15 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
-async def handle_message(bot: Bot, chat_id: int, text: str):
-    command = text.strip().split()[0].split("@")[0].lower()
+async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
+    parts = text.strip().split()
+    command = parts[0].split("@")[0].lower()
     if command == "/start":
         await bot.send_message(
             chat_id,
             "Привет! Каждое утро между 7:00 и 7:10 по Москве буду присылать сюда рацион на день.\n\n"
             "Команды:\n/menu — рацион на сегодня\n/pokupki — список покупок (закреплю)\n"
+            "/ves — записать вес и увидеть прогресс\n"
             "/chatid — узнать ID этого чата",
         )
     elif command == "/menu":
@@ -148,6 +151,33 @@ async def handle_message(bot: Bot, chat_id: int, text: str):
             )
     elif command == "/chatid":
         await bot.send_message(chat_id, f"ID этого чата: `{chat_id}`", parse_mode="Markdown")
+    elif command == "/ves":
+        history = state.setdefault("weight_log", [])
+        if len(parts) < 2:
+            if not history:
+                await bot.send_message(
+                    chat_id, f"Записей пока нет. Старт — {START_WEIGHT} кг. Пришли вес так: /ves 89.4"
+                )
+            else:
+                lines = [f"{e['date']}: {e['value']} кг" for e in history[-10:]]
+                change = history[-1]["value"] - START_WEIGHT
+                await bot.send_message(
+                    chat_id,
+                    "⚖️ *Динамика веса*\n\n" + "\n".join(lines) + f"\n\nОт старта ({START_WEIGHT} кг): {change:+.1f} кг",
+                    parse_mode="Markdown",
+                )
+            return
+        try:
+            value = float(parts[1].replace(",", "."))
+        except ValueError:
+            await bot.send_message(chat_id, "Не понял число. Пример: /ves 89.4")
+            return
+        prev = history[-1]["value"] if history else None
+        history.append({"date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"), "value": value})
+        msg = f"⚖️ Записал: {value} кг\nОт старта ({START_WEIGHT} кг): {value - START_WEIGHT:+.1f} кг"
+        if prev is not None:
+            msg += f"\nС прошлой записи: {value - prev:+.1f} кг"
+        await bot.send_message(chat_id, msg)
 
 
 async def handle_callback(bot: Bot, query):
@@ -179,7 +209,7 @@ async def main():
             state["last_update_id"] = update.update_id
             try:
                 if update.message and update.message.text:
-                    await handle_message(bot, update.message.chat_id, update.message.text)
+                    await handle_message(bot, update.message.chat_id, update.message.text, state)
                 elif update.callback_query:
                     await handle_callback(bot, update.callback_query)
             except Exception as e:
