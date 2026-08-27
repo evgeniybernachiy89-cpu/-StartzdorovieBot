@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ForceReply
 
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -13,10 +13,25 @@ STATE_FILE = "state.json"
 TIMEZONE = ZoneInfo("Europe/Moscow")
 SEND_HOUR = 7  # во сколько утра слать рацион (по Москве)
 START_WEIGHT = 90.0  # с чего начали — для расчёта прогресса в /ves
+QUIT_SMOKING_DATE = datetime(2026, 8, 17, 0, 0, tzinfo=TIMEZONE)
 
 DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 MEALS = ["завтрак", "обед", "перекус", "ужин"]
 MEAL_EMOJI = {"завтрак": "🌅", "обед": "🍲", "перекус": "🍎", "ужин": "🌙"}
+
+BTN_MENU = "📅 Рацион"
+BTN_WEIGHT = "⚖️ Вес"
+BTN_SHOP = "🛒 Покупки"
+BTN_SMOKE = "🚭 Не курю"
+BTN_WORKOUT = "🏋️ Тренировка"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_MENU, BTN_WEIGHT], [BTN_SHOP, BTN_SMOKE], [BTN_WORKOUT]],
+    resize_keyboard=True,
+)
+
+KNOWN_BUTTONS = {BTN_MENU, BTN_WEIGHT, BTN_SHOP, BTN_SMOKE, BTN_WORKOUT}
+KNOWN_COMMANDS = {"/start", "/menu", "/pokupki", "/ves", "/chatid"}
 
 # ---------- МЕНЮ НА НЕДЕЛЮ (0 = Пн ... 6 = Вс), повторяется весь месяц ----------
 MENU = {
@@ -92,6 +107,24 @@ REST_TEXT = (
     "считается на 100%) и лёгкая растяжка."
 )
 
+NUDGES = [
+    "Эй! Хватит греть диван — встал и потянулся 🙆",
+    "Тело затекло? 5 минут разминки прямо сейчас — и полегчает",
+    "Не засиживайся! Пройдись хотя бы до кухни и обратно 🚶",
+    "Пора подвигаться — тело не для того, чтобы просто сидеть",
+    "Эй, ленивая пятая точка — встряхнись! 😄",
+    "Опять сидим? Вставай, 10 приседаний — и можно дальше",
+    "Организм требует движения, а не ещё пять минут в телефоне",
+    "Потянись как кот — и почувствуешь разницу",
+]
+NUDGE_IMAGES = ["images/move1.png", "images/move2.png", "images/move3.png", "images/move4.png"]
+
+START_TEXT = (
+    "Привет! Каждое утро между 7:00 и 7:10 по Москве буду присылать сюда рацион на день, "
+    "плюс 3-4 раза за день буду напоминать подвигаться.\n\n"
+    "Кнопки внизу всегда под рукой — печатать команды не обязательно."
+)
+
 
 def build_day_message(day_idx: int):
     day = MENU[day_idx]
@@ -109,6 +142,13 @@ def build_day_message(day_idx: int):
     return text, InlineKeyboardMarkup(buttons)
 
 
+def smoking_duration_text():
+    delta = datetime.now(TIMEZONE) - QUIT_SMOKING_DATE
+    days = delta.days
+    hours = delta.seconds // 3600
+    return f"🚭 *Не куришь уже:* {days} дн. {hours} ч.\nС 17.08.2026 — так держать, это того стоит 💪"
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -124,22 +164,56 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
-async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
-    parts = text.strip().split()
-    command = parts[0].split("@")[0].lower()
-    if command == "/start":
+async def start_weight_prompt(bot: Bot, chat_id: int, state: dict):
+    await bot.send_message(
+        chat_id,
+        "Напиши вес числом, например: 89.4",
+        reply_markup=ForceReply(input_field_placeholder="Например: 89.4"),
+    )
+    state.setdefault("awaiting_weight", {})[str(chat_id)] = True
+
+
+async def process_weight_input(bot: Bot, chat_id: int, raw_text: str, state: dict):
+    try:
+        value = float(raw_text.strip().replace(",", "."))
+    except ValueError:
         await bot.send_message(
-            chat_id,
-            "Привет! Каждое утро между 7:00 и 7:10 по Москве буду присылать сюда рацион на день.\n\n"
-            "Команды:\n/menu — рацион на сегодня\n/pokupki — список покупок (закреплю)\n"
-            "/ves — записать вес и увидеть прогресс\n"
-            "/chatid — узнать ID этого чата",
+            chat_id, "Не понял число — нажми ⚖️ Вес и попробуй ещё раз", reply_markup=MAIN_KEYBOARD
         )
-    elif command == "/menu":
+        return
+    history = state.setdefault("weight_log", [])
+    prev = history[-1]["value"] if history else None
+    history.append({"date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"), "value": value})
+    msg = f"⚖️ Записал: {value} кг\nОт старта ({START_WEIGHT} кг): {value - START_WEIGHT:+.1f} кг"
+    if prev is not None:
+        msg += f"\nС прошлой записи: {value - prev:+.1f} кг"
+    await bot.send_message(chat_id, msg, reply_markup=MAIN_KEYBOARD)
+
+
+async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
+    text = text.strip()
+    key = str(chat_id)
+    awaiting = state.setdefault("awaiting_weight", {})
+
+    parts = text.split()
+    first_word = parts[0].split("@")[0].lower() if parts else ""
+    is_known = text in KNOWN_BUTTONS or first_word in KNOWN_COMMANDS
+
+    if awaiting.get(key):
+        awaiting.pop(key, None)
+        if not is_known:
+            await process_weight_input(bot, chat_id, text, state)
+            return
+
+    command = first_word
+
+    if command == "/start":
+        await bot.send_message(chat_id, START_TEXT, reply_markup=MAIN_KEYBOARD)
+    elif command == "/menu" or text == BTN_MENU:
         today = datetime.now(TIMEZONE).weekday()
         msg_text, markup = build_day_message(today)
         await bot.send_message(chat_id, msg_text, parse_mode="Markdown", reply_markup=markup)
-    elif command == "/pokupki":
+    elif command == "/pokupki" or text == BTN_SHOP:
         msg = await bot.send_message(chat_id, SHOPPING_LIST, parse_mode="Markdown")
         try:
             await bot.pin_chat_message(chat_id, msg.message_id)
@@ -151,33 +225,27 @@ async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
             )
     elif command == "/chatid":
         await bot.send_message(chat_id, f"ID этого чата: `{chat_id}`", parse_mode="Markdown")
-    elif command == "/ves":
-        history = state.setdefault("weight_log", [])
-        if len(parts) < 2:
-            if not history:
-                await bot.send_message(
-                    chat_id, f"Записей пока нет. Старт — {START_WEIGHT} кг. Пришли вес так: /ves 89.4"
-                )
-            else:
+    elif command == "/ves" and len(parts) >= 2:
+        await process_weight_input(bot, chat_id, parts[1], state)
+    elif command == "/ves" or text == BTN_WEIGHT:
+        if command == "/ves":
+            history = state.get("weight_log", [])
+            if history:
                 lines = [f"{e['date']}: {e['value']} кг" for e in history[-10:]]
                 change = history[-1]["value"] - START_WEIGHT
                 await bot.send_message(
                     chat_id,
-                    "⚖️ *Динамика веса*\n\n" + "\n".join(lines) + f"\n\nОт старта ({START_WEIGHT} кг): {change:+.1f} кг",
+                    "⚖️ *Динамика веса*\n\n"
+                    + "\n".join(lines)
+                    + f"\n\nОт старта ({START_WEIGHT} кг): {change:+.1f} кг",
                     parse_mode="Markdown",
                 )
-            return
-        try:
-            value = float(parts[1].replace(",", "."))
-        except ValueError:
-            await bot.send_message(chat_id, "Не понял число. Пример: /ves 89.4")
-            return
-        prev = history[-1]["value"] if history else None
-        history.append({"date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"), "value": value})
-        msg = f"⚖️ Записал: {value} кг\nОт старта ({START_WEIGHT} кг): {value - START_WEIGHT:+.1f} кг"
-        if prev is not None:
-            msg += f"\nС прошлой записи: {value - prev:+.1f} кг"
-        await bot.send_message(chat_id, msg)
+                return
+        await start_weight_prompt(bot, chat_id, state)
+    elif text == BTN_SMOKE:
+        await bot.send_message(chat_id, smoking_duration_text(), parse_mode="Markdown")
+    elif text == BTN_WORKOUT:
+        await bot.send_message(chat_id, WORKOUT_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 async def handle_callback(bot: Bot, query):
@@ -200,6 +268,32 @@ async def handle_callback(bot: Bot, query):
         await bot.send_message(chat_id, REST_TEXT, parse_mode="Markdown")
 
 
+def schedule_nudges_if_needed(state: dict, today_str: str):
+    if state.get("nudge_date") != today_str:
+        count = random.choice([3, 4])
+        hours = sorted(random.sample(range(9, 21), count))
+        state["nudge_date"] = today_str
+        state["nudge_times"] = [f"{h:02d}:{random.randint(0, 59):02d}" for h in hours]
+        state["nudge_sent"] = []
+
+
+async def maybe_send_nudges(bot: Bot, state: dict, now: datetime):
+    today_str = now.strftime("%Y-%m-%d")
+    schedule_nudges_if_needed(state, today_str)
+    current_hm = now.strftime("%H:%M")
+    for t in state.get("nudge_times", []):
+        if t <= current_hm and t not in state.get("nudge_sent", []):
+            text = random.choice(NUDGES)
+            image_path = random.choice(NUDGE_IMAGES)
+            try:
+                with open(image_path, "rb") as f:
+                    await bot.send_photo(CHAT_ID, photo=f, caption=text)
+            except Exception as e:
+                print("Не смог отправить картинку, шлю текстом:", e)
+                await bot.send_message(CHAT_ID, text)
+            state.setdefault("nudge_sent", []).append(t)
+
+
 async def main():
     async with Bot(token=TOKEN) as bot:
         state = load_state()
@@ -217,10 +311,12 @@ async def main():
 
         now = datetime.now(TIMEZONE)
         today_str = now.strftime("%Y-%m-%d")
-        if CHAT_ID and now.hour == SEND_HOUR and state.get("last_sent_date") != today_str:
-            msg_text, markup = build_day_message(now.weekday())
-            await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode="Markdown", reply_markup=markup)
-            state["last_sent_date"] = today_str
+        if CHAT_ID:
+            if now.hour == SEND_HOUR and state.get("last_sent_date") != today_str:
+                msg_text, markup = build_day_message(now.weekday())
+                await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode="Markdown", reply_markup=markup)
+                state["last_sent_date"] = today_str
+            await maybe_send_nudges(bot, state, now)
 
         save_state(state)
 
