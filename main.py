@@ -20,17 +20,12 @@ MEALS = ["завтрак", "обед", "перекус", "ужин"]
 MEAL_EMOJI = {"завтрак": "🌅", "обед": "🍲", "перекус": "🍎", "ужин": "🌙"}
 
 BTN_MENU = "📅 Рацион"
-BTN_WEIGHT = "⚖️ Вес"
 BTN_SHOP = "🛒 Покупки"
-BTN_SMOKE = "🚭 Не курю"
 BTN_WORKOUT = "🏋️ Тренировка"
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_MENU, BTN_WEIGHT], [BTN_SHOP, BTN_SMOKE], [BTN_WORKOUT]],
-    resize_keyboard=True,
-)
+MAIN_KEYBOARD = ReplyKeyboardMarkup([[BTN_MENU, BTN_SHOP], [BTN_WORKOUT]], resize_keyboard=True)
 
-KNOWN_BUTTONS = {BTN_MENU, BTN_WEIGHT, BTN_SHOP, BTN_SMOKE, BTN_WORKOUT}
+KNOWN_BUTTONS = {BTN_MENU, BTN_SHOP, BTN_WORKOUT}
 KNOWN_COMMANDS = {"/start", "/menu", "/pokupki", "/ves", "/chatid"}
 
 # ---------- МЕНЮ НА НЕДЕЛЮ (0 = Пн ... 6 = Вс), повторяется весь месяц ----------
@@ -121,9 +116,15 @@ NUDGE_IMAGES = ["images/move1.png", "images/move2.png", "images/move3.png", "ima
 
 START_TEXT = (
     "Привет! Каждое утро между 7:00 и 7:10 по Москве буду присылать сюда рацион на день, "
-    "плюс 3-4 раза за день буду напоминать подвигаться.\n\n"
-    "Кнопки внизу всегда под рукой — печатать команды не обязательно."
+    "плюс 3-4 раза за день буду напоминать подвигаться. Раз в неделю спрошу вес.\n\n"
+    "Кнопки внизу всегда под рукой."
 )
+
+SMOKE_REFRESH_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="refresh_smoke")]])
+
+
+def short_label(dish: str, limit: int = 26) -> str:
+    return dish if len(dish) <= limit else dish[:limit].rstrip() + "…"
 
 
 def build_day_message(day_idx: int):
@@ -142,11 +143,10 @@ def build_day_message(day_idx: int):
     return text, InlineKeyboardMarkup(buttons)
 
 
-def smoking_duration_text():
+def smoking_counter_text():
     delta = datetime.now(TIMEZONE) - QUIT_SMOKING_DATE
-    days = delta.days
-    hours = delta.seconds // 3600
-    return f"🚭 *Не куришь уже:* {days} дн. {hours} ч.\nС 17.08.2026 — так держать, это того стоит 💪"
+    days, hours = delta.days, delta.seconds // 3600
+    return f"🚭 *Не курю уже:* {days} дн. {hours} ч.\nСтарт: 17.08.2026 💪"
 
 
 def load_state():
@@ -164,22 +164,20 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
-async def start_weight_prompt(bot: Bot, chat_id: int, state: dict):
+async def start_weight_prompt(bot: Bot, chat_id, state: dict):
     await bot.send_message(
         chat_id,
-        "Напиши вес числом, например: 89.4",
+        "Пора взвеситься ⚖️ Напиши вес числом, например: 89.4",
         reply_markup=ForceReply(input_field_placeholder="Например: 89.4"),
     )
     state.setdefault("awaiting_weight", {})[str(chat_id)] = True
 
 
-async def process_weight_input(bot: Bot, chat_id: int, raw_text: str, state: dict):
+async def process_weight_input(bot: Bot, chat_id, raw_text: str, state: dict):
     try:
         value = float(raw_text.strip().replace(",", "."))
     except ValueError:
-        await bot.send_message(
-            chat_id, "Не понял число — нажми ⚖️ Вес и попробуй ещё раз", reply_markup=MAIN_KEYBOARD
-        )
+        await bot.send_message(chat_id, "Не понял число, попробуй ещё раз: /ves 89.4", reply_markup=MAIN_KEYBOARD)
         return
     history = state.setdefault("weight_log", [])
     prev = history[-1]["value"] if history else None
@@ -190,11 +188,10 @@ async def process_weight_input(bot: Bot, chat_id: int, raw_text: str, state: dic
     await bot.send_message(chat_id, msg, reply_markup=MAIN_KEYBOARD)
 
 
-async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
+async def handle_message(bot: Bot, chat_id, text: str, state: dict):
     text = text.strip()
     key = str(chat_id)
     awaiting = state.setdefault("awaiting_weight", {})
-
     parts = text.split()
     first_word = parts[0].split("@")[0].lower() if parts else ""
     is_known = text in KNOWN_BUTTONS or first_word in KNOWN_COMMANDS
@@ -206,7 +203,6 @@ async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
             return
 
     command = first_word
-
     if command == "/start":
         await bot.send_message(chat_id, START_TEXT, reply_markup=MAIN_KEYBOARD)
     elif command == "/menu" or text == BTN_MENU:
@@ -220,52 +216,91 @@ async def handle_message(bot: Bot, chat_id: int, text: str, state: dict):
         except Exception:
             await bot.send_message(
                 chat_id,
-                "Не смог закрепить сам — закрепи вручную (зажать сообщение → «Закрепить»). "
-                "Возможно, боту не дали право «Закрепление сообщений».",
+                "Не смог закрепить сам — закрепи вручную. Возможно, боту не дали право «Закрепление сообщений».",
             )
     elif command == "/chatid":
         await bot.send_message(chat_id, f"ID этого чата: `{chat_id}`", parse_mode="Markdown")
     elif command == "/ves" and len(parts) >= 2:
         await process_weight_input(bot, chat_id, parts[1], state)
-    elif command == "/ves" or text == BTN_WEIGHT:
-        if command == "/ves":
-            history = state.get("weight_log", [])
-            if history:
-                lines = [f"{e['date']}: {e['value']} кг" for e in history[-10:]]
-                change = history[-1]["value"] - START_WEIGHT
-                await bot.send_message(
-                    chat_id,
-                    "⚖️ *Динамика веса*\n\n"
-                    + "\n".join(lines)
-                    + f"\n\nОт старта ({START_WEIGHT} кг): {change:+.1f} кг",
-                    parse_mode="Markdown",
-                )
-                return
-        await start_weight_prompt(bot, chat_id, state)
-    elif text == BTN_SMOKE:
-        await bot.send_message(chat_id, smoking_duration_text(), parse_mode="Markdown")
+    elif command == "/ves":
+        history = state.get("weight_log", [])
+        if history:
+            lines = [f"{e['date']}: {e['value']} кг" for e in history[-10:]]
+            change = history[-1]["value"] - START_WEIGHT
+            await bot.send_message(
+                chat_id,
+                "⚖️ *Динамика веса*\n\n" + "\n".join(lines) + f"\n\nОт старта ({START_WEIGHT} кг): {change:+.1f} кг",
+                parse_mode="Markdown",
+            )
+        else:
+            await start_weight_prompt(bot, chat_id, state)
     elif text == BTN_WORKOUT:
         await bot.send_message(chat_id, WORKOUT_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
 
 
-async def handle_callback(bot: Bot, query):
+async def handle_callback(bot: Bot, query, state: dict):
     await bot.answer_callback_query(query.id)
     chat_id = query.message.chat_id
     data = query.data
     if data.startswith("swap:"):
         _, day_idx_str, meal = data.split(":")
         day_idx = int(day_idx_str)
-        alt_day = random.choice([d for d in MENU if d != day_idx])
-        alt_dish = MENU[alt_day][meal]
-        await bot.send_message(
-            chat_id,
-            f"{MEAL_EMOJI[meal]} *Замена ({meal}):* {alt_dish}\n_(из меню на {DAY_NAMES[alt_day].lower()})_",
-            parse_mode="Markdown",
-        )
+        buttons = [
+            [InlineKeyboardButton(short_label(MENU[d][meal]), callback_data=f"pick:{meal}:{d}")]
+            for d in MENU
+            if d != day_idx
+        ]
+        await bot.send_message(chat_id, f"Выбери замену ({meal}):", reply_markup=InlineKeyboardMarkup(buttons))
+    elif data.startswith("pick:"):
+        _, meal, day_idx_str = data.split(":")
+        dish = MENU[int(day_idx_str)][meal]
+        await bot.send_message(chat_id, f"{MEAL_EMOJI[meal]} *Заменил на:* {dish}", parse_mode="Markdown")
     elif data == "workout:yes":
         await bot.send_message(chat_id, WORKOUT_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
     elif data == "workout:rest":
         await bot.send_message(chat_id, REST_TEXT, parse_mode="Markdown")
+    elif data == "refresh_smoke":
+        await refresh_smoke_pin(bot, state)
+
+
+async def ensure_smoke_pin(bot: Bot, state: dict):
+    if state.get("smoke_pin_message_id"):
+        return
+    msg = await bot.send_message(
+        CHAT_ID, smoking_counter_text(), parse_mode="Markdown", reply_markup=SMOKE_REFRESH_MARKUP
+    )
+    try:
+        await bot.pin_chat_message(CHAT_ID, msg.message_id)
+    except Exception as e:
+        print("Не смог закрепить счётчик:", e)
+    state["smoke_pin_message_id"] = msg.message_id
+
+
+async def refresh_smoke_pin(bot: Bot, state: dict):
+    msg_id = state.get("smoke_pin_message_id")
+    if not msg_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=CHAT_ID,
+            message_id=msg_id,
+            text=smoking_counter_text(),
+            parse_mode="Markdown",
+            reply_markup=SMOKE_REFRESH_MARKUP,
+        )
+    except Exception:
+        pass  # текст не изменился с прошлой проверки — это нормально
+
+
+async def maybe_prompt_weekly_weight(bot: Bot, state: dict, now: datetime):
+    last = state.get("last_weight_prompt_date")
+    if last:
+        days_since = (now.date() - datetime.strptime(last, "%Y-%m-%d").date()).days
+        if days_since < 7:
+            return
+    if now.weekday() == 0 and now.hour == SEND_HOUR:
+        await start_weight_prompt(bot, CHAT_ID, state)
+        state["last_weight_prompt_date"] = now.strftime("%Y-%m-%d")
 
 
 def schedule_nudges_if_needed(state: dict, today_str: str):
@@ -305,7 +340,7 @@ async def main():
                 if update.message and update.message.text:
                     await handle_message(bot, update.message.chat_id, update.message.text, state)
                 elif update.callback_query:
-                    await handle_callback(bot, update.callback_query)
+                    await handle_callback(bot, update.callback_query, state)
             except Exception as e:
                 print("Ошибка обработки апдейта:", e)
 
@@ -316,6 +351,10 @@ async def main():
                 msg_text, markup = build_day_message(now.weekday())
                 await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode="Markdown", reply_markup=markup)
                 state["last_sent_date"] = today_str
+
+            await ensure_smoke_pin(bot, state)
+            await refresh_smoke_pin(bot, state)
+            await maybe_prompt_weekly_weight(bot, state, now)
             await maybe_send_nudges(bot, state, now)
 
         save_state(state)
